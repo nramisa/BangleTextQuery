@@ -48,3 +48,8 @@ IMAGES_DIR = os.path.join(EXTRACT_DIR, "images")  # expected structure: EXTRACT_
 
 print("Captions file:", CAPTIONS_FILE)
 print("Images directory:", IMAGES_DIR)
+
+if not os.path.exists(CAPTIONS_FILE):
+    raise FileNotFoundError(f"captions.json not found at {CAPTIONS_FILE}. Put it there or set DRIVE_FILE_ID_CAPTIONS.")
+if not os.path.isdir(IMAGES_DIR):
+    raise FileNotFoundError(f"images dir not found at {IMAGES_DIR}. Put images.zip contents there or set DRIVE_FILE_ID_IMAGES_ZIP.")
