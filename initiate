@@ -53,3 +53,28 @@ if not os.path.exists(CAPTIONS_FILE):
     raise FileNotFoundError(f"captions.json not found at {CAPTIONS_FILE}. Put it there or set DRIVE_FILE_ID_CAPTIONS.")
 if not os.path.isdir(IMAGES_DIR):
     raise FileNotFoundError(f"images dir not found at {IMAGES_DIR}. Put images.zip contents there or set DRIVE_FILE_ID_IMAGES_ZIP.")
+
+with open(CAPTIONS_FILE, "r", encoding="utf-8") as f:
+    captions_data = json.load(f)
+    
+disk_files = [fn for fn in os.listdir(IMAGES_DIR) if fn.lower().endswith(('.png', '.jpg', '.jpeg'))]
+map_lower_to_actual = {fn.lower(): fn for fn in disk_files}
+
+rows = []
+for item in captions_data:
+    fn = item.get('filename')
+    caps = item.get('caption')
+    if not fn or not caps:
+        continue
+    fn_l = fn.strip().lower()
+    if fn_l in map_lower_to_actual and isinstance(caps, list) and len(caps) > 0:
+        caps_clean = [c.strip() for c in caps if isinstance(c, str) and c.strip()]
+        if len(caps_clean) == 0:
+            continue
+        rows.append({'filename': map_lower_to_actual[fn_l], 'caption': caps_clean})
+
+df_all = pd.DataFrame(rows).drop_duplicates(subset=['filename']).reset_index(drop=True)
+print("Total aligned pairs (filesystem match):", len(df_all))
+
+train_df, val_df = train_test_split(df_all, test_size=0.2, random_state=42)
+print(f"Train: {len(train_df)}, Val: {len(val_df)}")
