@@ -1,0 +1,50 @@
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", DEVICE)
+DRIVE_FILE_ID_IMAGES_ZIP = "12Rq-OtvLKa2d_xW-Ha1kCQ0yPtKyKsMs"   
+DRIVE_FILE_ID_CAPTIONS = "17b69nhLjupztZHHEYKJhbe6mPE38JO3a"       
+ZIP_NAME_IMAGES = "images.zip"         
+CAPTIONS_LOCAL_NAME = "captions.json"  
+EXTRACT_DIR = "bangla_dataset_full"    
+ARTIFACT_DIR = "artifacts"; os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+BATCH_SIZE = 32          
+ACCUM_STEPS = 2          
+EPOCHS = 15              
+LR = 0.00005
+EMBED_DIM = 512
+MAX_LENGTH = 50 
+
+def download_file_from_gdrive(file_id, target_name):
+    url = f"https://drive.google.com/uc?id={file_id}"
+    print(f"Downloading {target_name} from drive id {file_id} ...")
+    gdown.download(url, target_name, quiet=False)
+    return target_name
+
+def extract_zip(zip_path, extract_to):
+    print(f"Extracting {zip_path} -> {extract_to}")
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        zf.extractall(extract_to)
+
+if DRIVE_FILE_ID_IMAGES_ZIP != "REPLACE_WITH_IMAGES_ZIP_FILE_ID":
+    download_file_from_gdrive(DRIVE_FILE_ID_IMAGES_ZIP, ZIP_NAME_IMAGES)
+    os.makedirs(EXTRACT_DIR, exist_ok=True)
+    try:
+        extract_zip(ZIP_NAME_IMAGES, EXTRACT_DIR)
+    except zipfile.BadZipFile:
+        print("images.zip seems corrupted or not a zip. Ensure you uploaded a valid zip.")
+else:
+    print("DRIVE_FILE_ID_IMAGES_ZIP not set - assuming images already present locally under EXTRACT_DIR/images")
+
+if DRIVE_FILE_ID_CAPTIONS != "REPLACE_WITH_CAPTIONS_FILE_ID":
+    download_file_from_gdrive(DRIVE_FILE_ID_CAPTIONS, CAPTIONS_LOCAL_NAME)
+    os.makedirs(EXTRACT_DIR, exist_ok=True)
+    try:
+        os.replace(CAPTIONS_LOCAL_NAME, os.path.join(EXTRACT_DIR, "captions.json"))
+    except Exception:
+        pass
+
+CAPTIONS_FILE = os.path.join(EXTRACT_DIR, "captions.json")
+IMAGES_DIR = os.path.join(EXTRACT_DIR, "images")  # expected structure: EXTRACT_DIR/images/*.png
+
+print("Captions file:", CAPTIONS_FILE)
+print("Images directory:", IMAGES_DIR)
