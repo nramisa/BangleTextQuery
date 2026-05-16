@@ -1,0 +1,48 @@
+# Search function and recall evaluation
+# loading precomputed embeddings (on device for speed)
+image_embeds = torch.from_numpy(np.load(os.path.join(ARTIFACT_DIR, "image_embeds.npy"))).to(DEVICE)
+text_embeds = torch.from_numpy(np.load(os.path.join(ARTIFACT_DIR, "text_embeds.npy"))).to(DEVICE)
+
+def search_images(query, top_k=5):
+    text_encoder.eval()
+    tokens = tokenizer(query, padding='max_length', truncation=True, max_length=MAX_LENGTH, return_tensors='pt').to(DEVICE)
+    with torch.no_grad():
+        txt_feats = text_encoder(**tokens).last_hidden_state[:,0,:]
+        txt_embeds = text_proj(txt_feats)
+        txt_embeds = F.normalize(txt_embeds, dim=1)
+        sims = txt_embeds @ image_embeds.T
+        topk = torch.topk(sims, k=top_k)
+    results = []
+    for i, score in zip(topk.indices.tolist()[0], topk.values.tolist()[0]):
+        fname = image_filenames[i]
+        captions_for_file = df_all[df_all['filename'] == fname]['caption'].values[0]
+        results.append((i, fname, float(score), captions_for_file))
+    return results
+
+def show_results(results):
+    cols = len(results)
+    plt.figure(figsize=(3*cols, 3))
+    for j, (_, fn, score, caption) in enumerate(results, 1):
+        plt.subplot(1, cols, j)
+        plt.imshow(Image.open(os.path.join(IMAGES_DIR, fn)).convert('RGB'))
+        plt.title(f"{fn}\n{score:.3f}")
+        plt.axis('off')
+    plt.show()
+
+# Recall@k
+def recall_at_k(text_embs, image_embs, k=1):
+    sims = text_embs @ image_embs.T
+    topk = sims.topk(k, dim=1).indices
+    targets = torch.arange(text_embs.size(0), device=sims.device)
+    hits = (topk == targets.unsqueeze(1)).any(dim=1).float()
+    return hits.mean().item()
+
+print("Recall@1:", recall_at_k(text_embeds, image_embeds, k=1))
+print("Recall@5:", recall_at_k(text_embeds, image_embeds, k=5))
+
+# Demo query
+demo_query = "রাস্তা।"
+res = search_images(demo_query, top_k=5)
+for idx, fn, score, cap in res:
+    print(f"{fn} | {score:.4f} | captions: {cap}")
+show_results(res)
