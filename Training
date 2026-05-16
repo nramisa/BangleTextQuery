@@ -1,0 +1,153 @@
+print("Starting training (only projection heads + unfreeze)")
+for epoch in range(EPOCHS):
+    image_encoder.train()
+    text_encoder.train()
+    total_loss = 0.0
+    step_count = 0
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
+        images = batch['image'].to(DEVICE)
+        captions_batch = batch['caption']   
+
+        # compute image features 
+        if any(p.requires_grad for p in image_encoder.parameters()):
+            img_feats = image_encoder(images)
+        else:
+            with torch.no_grad():
+                img_feats = image_encoder(images)
+        img_embeds_per_image = image_proj(img_feats)   # (B, EMBED_DIM)
+
+        # expanding each caption into a pair 
+        img_embeds_list = []
+        txt_embeds_list = []
+
+        for img_idx, captions_for_image in enumerate(captions_batch):
+            img_embed = img_embeds_per_image[img_idx]  # (EMBED_DIM,)
+            for c in captions_for_image:
+                # tokenize + encode text
+                tokens = tokenizer(c, padding='max_length', truncation=True, max_length=MAX_LENGTH, return_tensors='pt')
+                input_ids = tokens['input_ids'].to(DEVICE)
+                attention_mask = tokens['attention_mask'].to(DEVICE)
+
+                # computing text features (if text_encoder frozen use no_grad)
+                if any(p.requires_grad for p in text_encoder.parameters()):
+                    txt_feats = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0,:]
+                else:
+                    with torch.no_grad():
+                        txt_feats = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0,:]
+
+                txt_embed = text_proj(txt_feats)  # (1, EMBED_DIM)
+                img_embeds_list.append(img_embed.unsqueeze(0))
+                txt_embeds_list.append(txt_embed)
+
+        if len(img_embeds_list) == 0:
+            continue
+
+        img_embeds = torch.cat(img_embeds_list, dim=0)  # (Npairs, EMBED_DIM)
+        txt_embeds = torch.cat(txt_embeds_list, dim=0)  # (Npairs, EMBED_DIM)
+
+        # computing loss and backprop with accumulation
+        loss = clip_loss(img_embeds, txt_embeds, logit_scale) / ACCUM_STEPS
+        loss.backward()
+        step_count += 1
+
+        if (step + 1) % ACCUM_STEPS == 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * ACCUM_STEPS  # because we divided
+    avg_train_loss = total_loss / len(train_loader)
+    print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
+
+    # validation
+    image_encoder.eval()
+    text_encoder.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch['image'].to(DEVICE)
+            captions_batch = batch['caption']
+
+            # image features
+            img_feats = image_encoder(images) if any(p.requires_grad for p in image_encoder.parameters()) else image_encoder(images)
+            img_embeds_per_image = image_proj(img_feats)
+
+            img_embeds_list = []
+            txt_embeds_list = []
+            for img_idx, captions_for_image in enumerate(captions_batch):
+                img_embed = img_embeds_per_image[img_idx]
+                for c in captions_for_image:
+                    tokens = tokenizer(c, padding='max_length', truncation=True, max_length=MAX_LENGTH, return_tensors='pt')
+                    input_ids = tokens['input_ids'].to(DEVICE)
+                    attention_mask = tokens['attention_mask'].to(DEVICE)
+                    txt_feats = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0,:]
+                    txt_embed = text_proj(txt_feats)
+                    img_embeds_list.append(img_embed.unsqueeze(0))
+                    txt_embeds_list.append(txt_embed)
+            if len(img_embeds_list) == 0:
+                continue
+            img_embeds = torch.cat(img_embeds_list, dim=0)
+            txt_embeds = torch.cat(txt_embeds_list, dim=0)
+            val_loss += clip_loss(img_embeds, txt_embeds, logit_scale).item()
+    avg_val_loss = val_loss / len(val_loader)
+    
+    print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+
+torch.save(image_proj.state_dict(), os.path.join(ARTIFACT_DIR, "image_proj.pt"))
+torch.save(text_proj.state_dict(), os.path.join(ARTIFACT_DIR, "text_proj.pt"))
+torch.save({'logit_scale': logit_scale.detach().cpu().numpy()}, os.path.join(ARTIFACT_DIR, "logit_scale.pt"))
+print("Saved projection heads and logit scale.")
+
+# Precompute embeddings for retrieval (use train+val for coverage)
+print("Precomputing embeddings for retrieval (train+val)...")
+image_encoder.eval()
+text_encoder.eval()
+all_image_embeds = []
+all_text_embeds = []
+all_filenames = []
+
+with torch.no_grad():
+    combined_loader = chain(train_loader, val_loader)
+    for batch in tqdm(combined_loader, desc="Encoding images & texts"):
+        images = batch['image'].to(DEVICE)
+        captions_batch = batch['caption']
+        filenames_batch = batch['filename']
+
+        # image embeddings
+        img_feats = image_encoder(images)  # no_grad already set
+        img_embeds = image_proj(img_feats)
+        img_embeds = F.normalize(img_embeds, dim=1)
+        all_image_embeds.append(img_embeds.cpu())
+
+        # filenames
+        all_filenames.extend(filenames_batch)
+
+        # text embeddings: averaging all caption embeddings per image 
+        for captions_for_image in captions_batch:
+            txt_embeds_per_image = []
+            for c in captions_for_image:
+                tokens = tokenizer(c, padding='max_length', truncation=True, max_length=MAX_LENGTH, return_tensors='pt')
+                input_ids = tokens['input_ids'].to(DEVICE)
+                attention_mask = tokens['attention_mask'].to(DEVICE)
+                txt_feats = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0,:]
+                txt_embed = text_proj(txt_feats)
+                txt_embed = F.normalize(txt_embed, dim=1)
+                txt_embeds_per_image.append(txt_embed)
+            # average
+            if len(txt_embeds_per_image) > 0:
+                avg_txt = torch.mean(torch.stack(txt_embeds_per_image), dim=0)
+                all_text_embeds.append(avg_txt.cpu())
+
+image_embeds = torch.cat(all_image_embeds, dim=0)   # (N_images, EMBED_DIM)
+text_embeds = torch.cat(all_text_embeds, dim=0)     # (N_images, EMBED_DIM)
+
+np.save(os.path.join(ARTIFACT_DIR, "image_embeds.npy"), image_embeds.numpy())
+np.save(os.path.join(ARTIFACT_DIR, "image_filenames.npy"), np.array(all_filenames))
+np.save(os.path.join(ARTIFACT_DIR, "text_embeds.npy"), text_embeds.numpy())
+print("Saved image_embeds.npy, image_filenames.npy, text_embeds.npy")
+
+# load filenames to memory for search
+image_filenames = np.load(os.path.join(ARTIFACT_DIR, "image_filenames.npy"), allow_pickle=True)
