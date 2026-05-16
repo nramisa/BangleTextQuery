@@ -1,0 +1,76 @@
+TEXT_MODEL_NAME = "csebuetnlp/banglabert"  # public Bangla BERT
+tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME)
+text_encoder = AutoModel.from_pretrained(TEXT_MODEL_NAME).to(DEVICE)
+
+# Image encoder: ViT (torchvision)
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+vit_weights = ViT_B_16_Weights.IMAGENET1K_V1
+image_encoder = vit_b_16(weights=vit_weights)
+image_encoder.heads = nn.Identity()   # removes classifier head
+image_encoder = image_encoder.to(DEVICE)
+
+# projection heads
+image_proj = nn.Linear(768, EMBED_DIM).to(DEVICE)
+text_proj = nn.Linear(text_encoder.config.hidden_size, EMBED_DIM).to(DEVICE)
+
+# learnable logit scale (CLIP-style)
+logit_scale = nn.Parameter(torch.ones([], device=DEVICE) * np.log(1/0.07))
+
+# Freeze encoders 
+for p in text_encoder.parameters():
+    p.requires_grad = False
+for p in image_encoder.parameters():
+    p.requires_grad = False
+
+k_text = 1  # unfreeze last 1 layer
+
+if k_text > 0:
+    try:
+        layers = list(text_encoder.encoder.layer)  # BERT encoder layers
+        for layer in layers[-k_text:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+        print(f"Unfroze last {k_text} layers of text encoder")
+    except Exception as e:
+        print("Couldn't unfreeze text encoder layers; skipping", e)
+        
+k_vit = 1  # unfreeze last 1 ViT block
+
+if k_vit > 0:
+    try:
+        # torchvision ViT block access varies by version
+        blocks = None
+        if hasattr(image_encoder, "encoder") and hasattr(image_encoder.encoder, "layers"):
+            blocks = list(image_encoder.encoder.layers)
+        elif hasattr(image_encoder, "encoder") and hasattr(image_encoder.encoder, "blocks"):
+            blocks = list(image_encoder.encoder.blocks)
+        elif hasattr(image_encoder, "blocks"):
+            blocks = list(image_encoder.blocks)
+
+        if blocks is not None:
+            for b in blocks[-k_vit:]:
+                for p in b.parameters():
+                    p.requires_grad = True
+        print(f"Unfroze last {k_vit} blocks of ViT")
+    except Exception as e:
+        print("Couldn't unfreeze ViT blocks; skipping", e)
+
+# Optimizer (only trainable params + logit_scale)
+import math
+trainable_params = [p for p in list(image_proj.parameters()) + list(text_proj.parameters()) + [logit_scale] if p.requires_grad]
+optimizer = AdamW(trainable_params, lr=LR, weight_decay=0.01)
+
+from transformers import get_linear_schedule_with_warmup
+num_training_steps = EPOCHS * math.ceil(len(train_loader) / ACCUM_STEPS)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=100, num_training_steps=num_training_steps)
+
+# Loss function (uses learnable logit_scale)
+def clip_loss(image_embeds, text_embeds, logit_scale_param):
+    image_embeds = F.normalize(image_embeds, dim=1)
+    text_embeds = F.normalize(text_embeds, dim=1)
+    scale = logit_scale_param.exp()
+    logits = (image_embeds @ text_embeds.T) * scale
+    labels = torch.arange(logits.size(0), device=logits.device)
+    loss_i2t = nn.CrossEntropyLoss()(logits, labels)
+    loss_t2i = nn.CrossEntropyLoss()(logits.T, labels)
+    return (loss_i2t + loss_t2i) / 2
